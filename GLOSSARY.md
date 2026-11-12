@@ -1,0 +1,1 @@
+../nf-align/docs/GLOSSARY.md
