@@ -6,6 +6,7 @@
  */
 
 include { BUILD_SAMPLESHEET } from './modules/local/build_samplesheet'
+include { PREFLIGHT } from './modules/local/preflight'
 
 /*
  * Types only: the defaults are in nextflow.config, which conf/base.config reads before this script is parsed.
@@ -69,6 +70,30 @@ def runDir() {
     "${datasetRoot(params.dataset)}/genotyping_samplesheets/${params.arGuid}"
 }
 
+// the files of an SG's gvcf analysis, by registration key: the gVCF, then its index
+def gvcfFiles(meta) {
+    [gvcf: meta.gvcf, index: "${meta.gvcf}.tbi".toString()]
+}
+
+// the gVCF QC files this run publishes for an SG, the secondary files of its gvcf_qc analysis
+def gvcfQcFiles(meta) {
+    def names = [
+        variant_calling_summary_metrics: 'variant_calling_summary_metrics',
+        variant_calling_detail_metrics: 'variant_calling_detail_metrics',
+        bcftools_stats: 'bcftools-stats',
+    ]
+    names.collectEntries { key, suffix -> [(key): "${meta.qcDir}/${meta.id}.${suffix}".toString()] }
+}
+
+// every file this run publishes for an SG, which the pre-flight check makes sure don't exist yet. A genotyped
+// SG's gVCF is already registered, so at most its gVCF QC is published
+def outputs(meta) {
+    if (meta.kind == 'to_genotype') {
+        return gvcfFiles(meta) + gvcfQcFiles(meta)
+    }
+    meta.kind == 'qc_only' ? gvcfQcFiles(meta) : [:]
+}
+
 // the .dict of a reference: the <name>.dict beside <name>.fasta, where Picard and GATK look for it. null for a
 // FASTA without a FASTA extension
 def refDict(fasta) {
@@ -125,6 +150,45 @@ def checkNoRunRecords() {
     }
 }
 
+/*
+ * A sample sheet row -> meta: the SG's destinations, and what its tasks read. kind is to_genotype, genotyped, or
+ * qc_only (a genotyped SG whose gVCF has no gvcf_qc analysis, with --qc_genotyped). ref is the reference the SG's
+ * tasks read: the CRAM's for an SG to genotype, which its new gVCF is then written against, or the registered
+ * gVCF's otherwise. gvcf is the registered gVCF, or where this run publishes the new one.
+ */
+def parseRow(r) {
+    // decides where the SG is published and registered, and which dataset its compute is billed to
+    if (!r.dataset) {
+        fail("${r.sg_id}: a row needs dataset, the dataset the SG belongs to")
+    }
+    def genotyped = r.gvcf as boolean
+    if (!genotyped) {
+        def missing = ['cram', 'cram_ref', 'selfsm'].findAll { column -> !r[column] }
+        if (missing) {
+            fail("${r.sg_id}: a row to genotype needs ${missing.join(', ')}")
+        }
+    }
+    def kind = !genotyped ? 'to_genotype' : (params.qc_genotyped && !r.gvcf_qc ? 'qc_only' : 'genotyped')
+    def ref = genotyped ? r.gvcf_ref : r.cram_ref
+    // GATK and Picard need the <name>.dict beside the reference. Only checked where a task reads it
+    if (kind != 'genotyped' && !refDict(ref)) {
+        fail("${r.sg_id}: reference '${ref}' must end in .fasta, .fa or .fna, with its .dict beside it")
+    }
+    def base = "${datasetRoot(r.dataset)}/${typePrefix()}"
+    [
+        id: r.sg_id,
+        kind: kind,
+        dataset: r.dataset,
+        project: metamistProject(r.dataset),
+        cram: r.cram ?: null,
+        ref: ref,
+        selfsm: r.selfsm ?: null,
+        gvcf: genotyped ? r.gvcf : "${base}gvcf/${r.sg_id}.g.vcf.gz".toString(),
+        gvcfDir: "${base}gvcf".toString(),
+        qcDir: "${base}gvcf_qc/${r.sg_id}".toString(),
+    ]
+}
+
 // error() inside a channel operator reaches the console only as "Unexpected error", so log the reason first
 def fail(message) {
     log.error(message)
@@ -141,7 +205,7 @@ workflow {
     // the cached pre-flight check lets its own published files through
     def cohorts = params.cohorts ? idList(params.cohorts) : []
     def sgids = params.sgids ? idList(params.sgids) : []
-    BUILD_SAMPLESHEET(
+    def sheet = BUILD_SAMPLESHEET(
         params.accessLevel,
         params.sequencing_type,
         cohorts,
@@ -150,4 +214,20 @@ workflow {
         params.genotyped_ref_fasta,
         runDir(),
     )
+
+    // hold every SG that publishes anything until the whole sheet has passed the pre-flight check, so a clash fails
+    // the run before any work starts. Genotyped SGs that aren't QC-only publish nothing, and go no further
+    def rows = PREFLIGHT(
+        sheet
+            .splitCsv(header: true, sep: '\t')
+            .map { r -> parseRow(r) }
+            .filter { meta -> meta.kind != 'genotyped' }
+            .toList()
+            .map { metas -> [metas, metas.collectMany { meta -> outputs(meta).values() }.unique()] }
+    )
+        .flatMap { metas -> metas }
+        .branch { meta ->
+            to_genotype: meta.kind == 'to_genotype'
+            qc_only: meta.kind == 'qc_only'
+        }
 }
