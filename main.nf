@@ -10,6 +10,8 @@ include { MAKE_INTERVALS } from './modules/local/make_intervals'
 include { PREFLIGHT } from './modules/local/preflight'
 include { GENOTYPE } from './subworkflows/local/genotype'
 include { GVCF_QC } from './subworkflows/local/gvcf_qc'
+include { REGISTER_ANALYSIS as REGISTER_GVCF } from './modules/local/register_analysis'
+include { REGISTER_ANALYSIS as REGISTER_GVCF_QC } from './modules/local/register_analysis'
 
 /*
  * Types only: the defaults are in nextflow.config, which conf/base.config reads before this script is parsed.
@@ -259,9 +261,46 @@ workflow {
 
     // every new gVCF, against the reference its CRAM was written with, and each QC-only SG's registered gVCF,
     // against the one its gvcf analysis records (meta.ref, from the row's gvcf_ref)
-    GVCF_QC(
+    def qc = GVCF_QC(
         genotyped.gvcf.mix(rows.qc_only.map { meta -> [meta, file(meta.gvcf), file("${meta.gvcf}.tbi")] }),
         file(genome ? params.genome_evaluation_regions : params.exome_evaluation_regions),
         [file(params.dbsnp_vcf), file("${params.dbsnp_vcf}.idx")],
     )
+
+    if (params.register) {
+        // one analysis per new gVCF, with its index as a secondary file. Its meta records how it was made: the
+        // reference and CRAM it came from, the caller, that it wasn't genotyped in DRAGEN mode (unlike cpg-flow's),
+        // and the contamination fraction it was genotyped with
+        def registered = REGISTER_GVCF(
+            genotyped.gvcf.map { meta, _gvcf, _tbi ->
+                def files = gvcfFiles(meta)
+                def analysis_meta = [
+                    sequencing_type: params.sequencing_type,
+                    'ar-guid': params.arGuid,
+                    ref_fasta: meta.ref,
+                    cram: meta.cram,
+                    caller: "gatk-${meta.gatk_version}",
+                    dragen_mode: false,
+                    contamination: meta.contamination,
+                ]
+                [meta, files.gvcf, files.subMap('index'), analysis_meta]
+            },
+            'gvcf',
+            params.register_wait_minutes,
+        )
+
+        // and one gvcf_qc analysis per SG: the gVCF again, with every QC file as a secondary file. Only once the
+        // gVCF's own analysis exists, so it never points at an unregistered gVCF. A QC-only SG's is registered
+        // already
+        def has_gvcf_analysis = registered.mix(rows.qc_only)
+        REGISTER_GVCF_QC(
+            qc.qc.map { meta, _summary, _detail, _stats -> [meta.id, meta] }
+                .join(has_gvcf_analysis.map { meta -> [meta.id, true] })
+                .map { _id, meta, _registered ->
+                    [meta, meta.gvcf, gvcfQcFiles(meta), [sequencing_type: params.sequencing_type, 'ar-guid': params.arGuid]]
+                },
+            'gvcf_qc',
+            params.register_wait_minutes,
+        )
+    }
 }

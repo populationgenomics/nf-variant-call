@@ -557,17 +557,114 @@ def test_gvcf_qc_uses_the_evaluation_regions_and_the_gvcfs_own_reference(run, tm
         assert {p.name for p in (workdir / 'ref').iterdir()} == {f'{ref}.fasta', f'{ref}.fasta.fai'}
 
 
-def test_a_failed_qc_task_publishes_only_the_other_tasks_files(run, tmp_path):
+@pytest.mark.parametrize(('process', 'sg_id'), [('BCFTOOLS_STATS', 'CPG3'), ('VARIANT_CALLING_METRICS', QC_ONLY)])
+def test_a_failed_qc_task_registers_no_gvcf_qc_for_that_sg(run, tmp_path, process, sg_id):
     inject = tmp_path / 'fail.config'
     inject.write_text(
-        "process { withName: 'BCFTOOLS_STATS' { beforeScript = { meta.id == 'CPG3' ? 'exit 1' : 'true' } } }\n",
+        f"process {{ withName: '{process}' {{ beforeScript = {{ meta.id == '{sg_id}' ? 'exit 1' : 'true' }} }} }}\n",
     )
-    result, out, tasks = run('-c', str(inject), '--genotyping_intervals', '2')
+    result, out, tasks = run('-c', str(inject), '--genotyping_intervals', '2', '--qc_genotyped', 'true',
+                             '--register', 'true')  # fmt: skip
     assert result.returncode == 0, result.stdout + result.stderr
-    # the gVCF is unaffected
-    assert (gvcf_dir(out, OTHER) / 'CPG3.g.vcf.gz').exists()
-    assert published_qc(out, {'CPG3': OTHER})['CPG3'] == {
-        'CPG3.variant_calling_summary_metrics',
-        'CPG3.variant_calling_detail_metrics',
-    }
-    assert 'CPG3' in task_names(tasks, 'VARIANT_CALLING_METRICS')
+    # gVCF QC is all or nothing: the SG's QC isn't registered, and the failed task's files aren't published. Each
+    # task publishes its own files, so the other task's are (as in nf-align's CRAM QC)
+    assert task_names(tasks, 'REGISTER_GVCF_QC') == (set(TO_GENOTYPE) | {QC_ONLY}) - {sg_id}
+    published = published_qc(out, TO_GENOTYPE | {QC_ONLY: PROJECT})[sg_id]
+    failed = {'BCFTOOLS_STATS': ['bcftools-stats']}.get(process, GVCF_QC_SUFFIXES[:2])
+    assert published == {f'{sg_id}.{suffix}' for suffix in GVCF_QC_SUFFIXES if suffix not in failed}
+    # a QC failure never holds up the gVCF's registration
+    assert task_names(tasks, 'REGISTER_GVCF') == set(TO_GENOTYPE)
+
+
+def registration(tasks: list[dict], tmp_path: Path, process: str, sg_id: str) -> str:
+    """The registration command a stub REGISTER_* task printed."""
+    return (task_dir(tasks, tmp_path, f'{process} ({sg_id})') / '.command.out').read_text().strip()
+
+
+@pytest.mark.parametrize(('access_level', 'suffix'), [('standard', ''), ('test', '-test')])
+def test_each_new_gvcf_is_registered_at_its_published_path_in_its_sgs_project(run, tmp_path, access_level, suffix):
+    result, out, tasks = run('--register', 'true', '--accessLevel', access_level, '--genotyping_intervals', '2')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert task_names(tasks, 'REGISTER_GVCF') == set(TO_GENOTYPE)
+    for sg_id, ds, ref in [('CPG1', PROJECT, 'unmasked'), ('CPG3', OTHER, 'masked')]:
+        gvcf = gvcf_dir(out, ds) / f'{sg_id}.g.vcf.gz'
+        cram = tmp_path / 'data' / sg_id / f'{sg_id}.cram'
+        # output_root decides the location, not the access level
+        assert registration(tasks, tmp_path, 'REGISTER_GVCF', sg_id) == (
+            f'python3 -m cpg_utils.metamist_registration --dry --project {ds}{suffix} --output {gvcf} --type gvcf '
+            f'--secondary index={gvcf}.tbi --sgs {sg_id} '
+            f'--meta sequencing_type=genome ar-guid=local-test ref_fasta={tmp_path}/refs/{ref}.fasta cram={cram} '
+            'caller=gatk-stub dragen_mode=false contamination=0.01'
+        )
+
+
+@pytest.mark.parametrize(('access_level', 'suffix'), [('standard', ''), ('test', '-test')])
+def test_gvcf_qc_is_registered_as_one_analysis_of_the_gvcf(run, tmp_path, access_level, suffix):
+    result, out, tasks = run('--register', 'true', '--accessLevel', access_level, '--qc_genotyped', 'true',
+                             '--genotyping_intervals', '2', sequencing_type='exome')  # fmt: skip
+    assert result.returncode == 0, result.stdout + result.stderr
+    # one per gVCF: each new one, and the QC-only SG's registered one. CPG4's has gVCF QC already
+    assert task_names(tasks, 'REGISTER_GVCF_QC') == set(TO_GENOTYPE) | {QC_ONLY}
+    registered = tmp_path / 'data' / QC_ONLY / f'{QC_ONLY}.g.vcf.gz'
+    for sg_id, ds, gvcf in [
+        ('CPG3', OTHER, gvcf_dir(out, OTHER, 'exome') / 'CPG3.g.vcf.gz'),
+        (QC_ONLY, PROJECT, registered),
+    ]:
+        folder = gvcf_qc_dir(out, ds, sg_id, 'exome')
+        assert registration(tasks, tmp_path, 'REGISTER_GVCF_QC', sg_id) == (
+            f'python3 -m cpg_utils.metamist_registration --dry --project {ds}{suffix} --output {gvcf} '
+            '--type gvcf_qc --secondary '
+            f'variant_calling_summary_metrics={folder}/{sg_id}.variant_calling_summary_metrics '
+            f'variant_calling_detail_metrics={folder}/{sg_id}.variant_calling_detail_metrics '
+            f'bcftools_stats={folder}/{sg_id}.bcftools-stats '
+            f'--sgs {sg_id} --meta sequencing_type=exome ar-guid=local-test'
+        )
+
+
+def test_gvcf_qc_is_never_registered_when_the_gvcfs_registration_failed(run, tmp_path):
+    inject = tmp_path / 'fail.config'
+    inject.write_text(
+        "process { withName: 'REGISTER_GVCF' { beforeScript = { meta.id == 'CPG2' ? 'exit 1' : 'true' } } }\n"
+    )
+    result, out, tasks = run('-c', str(inject), '--register', 'true', '--genotyping_intervals', '2')
+    assert result.returncode == 0, result.stdout + result.stderr
+    # retried once, then ignored
+    assert [t['status'] for t in tasks if t['name'].endswith('REGISTER_GVCF (CPG2)')] == ['FAILED', 'FAILED']
+    assert task_names(tasks, 'REGISTER_GVCF_QC') == set(TO_GENOTYPE) - {'CPG2'}
+    # its gVCF and QC are published, unregistered, and a new run's pre-flight check stops on them
+    assert (gvcf_dir(out, PROJECT) / 'CPG2.g.vcf.gz').exists()
+    assert published_qc(out, {'CPG2': PROJECT})['CPG2']
+
+
+def test_nothing_is_registered_without_register(run):
+    # the test profile sets --register false
+    result, _out, tasks = run('--qc_genotyped', 'true', '--genotyping_intervals', '2')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert task_names(tasks, 'POSTPROC_GVCF') == set(TO_GENOTYPE)
+    assert not [t for t in tasks if 'REGISTER' in t['name']]
+
+
+def test_per_sg_tasks_are_labelled_with_the_sgs_dataset(run, tmp_path):
+    inject = tmp_path / 'labels.config'
+    inject.write_text(
+        'process {\n'
+        "    withName: 'MAKE_INTERVALS|GENOTYPE_INTERVAL|POSTPROC_GVCF|VARIANT_CALLING_METRICS|BCFTOOLS_STATS|"
+        "REGISTER_GVCF|REGISTER_GVCF_QC' {\n"
+        '        beforeScript = { "echo LABEL=${task.resourceLabels.dataset}" }\n'
+        '    }\n'
+        '}\n',
+    )
+    result, _out, tasks = run('-c', str(inject), '--register', 'true', '--qc_genotyped', 'true',
+                              '--genotyping_intervals', '2')  # fmt: skip
+    assert result.returncode == 0, result.stdout + result.stderr
+    labelled = [t for t in tasks if t['name'] not in {'BUILD_SAMPLESHEET (standard)', 'PREFLIGHT'}]
+    # MAKE_INTERVALS 1, GENOTYPE_INTERVAL 3 x 2, POSTPROC_GVCF 3 and REGISTER_GVCF 3, then 4 each of the two QC
+    # processes and REGISTER_GVCF_QC
+    assert len(labelled) == 25
+    dataset = TO_GENOTYPE | {QC_ONLY: PROJECT}
+    for t in labelled:
+        tag = t['name'].split('(')[1].rstrip(')').split(':')[0]
+        # the run-level MAKE_INTERVALS is billed to the analysis dataset
+        expected = PROJECT if t['name'].startswith('MAKE_INTERVALS') else dataset[tag]
+        # beforeScript's output goes to the task log, not .command.out
+        assert f'LABEL={expected}' in (task_dir(tasks, tmp_path, t['name']) / '.command.log').read_text()
