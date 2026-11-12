@@ -6,6 +6,7 @@
  */
 
 include { BUILD_SAMPLESHEET } from './modules/local/build_samplesheet'
+include { MAKE_INTERVALS } from './modules/local/make_intervals'
 include { PREFLIGHT } from './modules/local/preflight'
 
 /*
@@ -198,6 +199,9 @@ def fail(message) {
 workflow {
     validateParams()
     checkNoRunRecords()
+    def genome = params.sequencing_type == 'genome'
+    // matches {genome,exome}_scatter_count in cpg-flow's config_template.toml
+    def interval_count = params.genotyping_intervals ?: (genome ? 30 : 1)
 
     // every run starts from a sheet built from Metamist: SGs are discovered through cohorts, or queried directly,
     // and one of the two lists is empty. A resumed run takes the sheet from the cache, not from Metamist, which
@@ -230,4 +234,12 @@ workflow {
             to_genotype: meta.kind == 'to_genotype'
             qc_only: meta.kind == 'qc_only'
         }
+
+    // once per run, and only if there's anything to genotype: every SG gets the same lists
+    def intervals = MAKE_INTERVALS(
+        file(genome ? params.calling_regions_genome : params.calling_regions_exome),
+        file(params.calling_exclusions),
+        rows.to_genotype.first().map { _meta -> interval_count },
+        genome ? 100000 : 0,
+    )
 }

@@ -67,6 +67,12 @@ def completed(tasks: list[dict]) -> set[str]:
     return {t['name'] for t in tasks if t['status'] == 'COMPLETED' and t['name'] != 'BUILD_SAMPLESHEET (standard)'}
 
 
+def task_dir(tasks: list[dict], tmp_path: Path, name: str) -> Path:
+    """The work dir of the task with this name, e.g. 'MAKE_INTERVALS (30)'."""
+    workdir = next(t for t in tasks if t['name'].startswith(name))['hash']
+    return next((tmp_path / 'work').glob(f'{workdir}*'))
+
+
 def edit_sheet(tmp_path: Path, sg_id: str, **values: str) -> None:
     """Set columns of one SG's row in the sheet BUILD_SAMPLESHEET's stub hands over."""
     sheet = tmp_path / 'sheet.tsv'
@@ -203,7 +209,7 @@ def test_workflow_needs_every_container(run, tmp_path, name):
 def test_cohorts_or_sgids_are_built_into_the_published_sheet(run, tmp_path, inputs):
     result, out, tasks = run(inputs=inputs)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert {t['name'] for t in tasks} == {'BUILD_SAMPLESHEET (standard)', 'PREFLIGHT'}
+    assert 'BUILD_SAMPLESHEET (standard)' in {t['name'] for t in tasks}
     # the run records, just the sample sheet, go to the analysis dataset only
     assert {p.name for p in run_dir(out).iterdir()} == {'samplesheet.tsv'}
     assert not (out / OTHER / 'genotyping_samplesheets').exists()
@@ -333,10 +339,8 @@ def test_resume_reuses_the_sheet_and_skips_the_checks_it_passed(run):
     touch(gvcf_dir(out, PROJECT) / 'CPG1.g.vcf.gz')
     result, _out, tasks = run('-resume')
     assert result.returncode == 0, result.stdout + result.stderr
-    assert {(t['name'], t['status']) for t in tasks} == {
-        ('BUILD_SAMPLESHEET (standard)', 'CACHED'),
-        ('PREFLIGHT', 'CACHED'),
-    }
+    assert {'BUILD_SAMPLESHEET (standard)', 'PREFLIGHT'} <= {t['name'] for t in tasks}
+    assert {t['status'] for t in tasks} == {'CACHED'}
 
 
 def test_resume_checks_again_after_a_failed_pre_flight_check(run, tmp_path):
@@ -348,3 +352,27 @@ def test_resume_checks_again_after_a_failed_pre_flight_check(run, tmp_path):
         assert '1 output(s) already exist' in result.stdout + result.stderr
         assert str(clash) in result.stdout + result.stderr
         assert not completed(tasks)
+
+
+@pytest.mark.parametrize(
+    ('args', 'sequencing_type', 'count'),
+    [((), 'genome', 30), ((), 'exome', 1), (('--genotyping_intervals', '1'), 'genome', 1),
+     (('--genotyping_intervals', '3'), 'exome', 3)],
+)  # fmt: skip
+def test_make_intervals_makes_n_lists_in_genomic_order(run, tmp_path, args, sequencing_type, count):
+    result, _out, tasks = run(*args, sequencing_type=sequencing_type)
+    assert result.returncode == 0, result.stdout + result.stderr
+    made = sorted(p.name for p in task_dir(tasks, tmp_path, 'MAKE_INTERVALS').glob('*.interval_list'))
+    assert made == [f'{i:04d}.interval_list' for i in range(1, count + 1)]
+    # the sequencing type's calling regions, and the exclusions whatever N is
+    staged = task_dir(tasks, tmp_path, 'MAKE_INTERVALS')
+    assert [p.name for p in (staged / 'regions').iterdir()] == [f'{sequencing_type}_calling.interval_list']
+    assert [p.name for p in (staged / 'exclusions').iterdir()] == ['exclusions.interval_list']
+
+
+def test_make_intervals_only_runs_if_anything_is_to_genotype(run, tmp_path):
+    rows = [r for r in read_tsv(tmp_path / 'sheet.tsv') if r['gvcf']]
+    write_sheet(rows, str(tmp_path / 'sheet.tsv'))
+    result, _out, tasks = run('--qc_genotyped', 'true')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not [t for t in tasks if t['name'].startswith('MAKE_INTERVALS')]
