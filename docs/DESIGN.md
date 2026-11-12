@@ -182,8 +182,8 @@ are:
    - rename the sample to the SG ID
    - `tabix`
 
-The output is `<sg>.g.vcf.gz` and `.tbi`. The task also records the GATK version (`gatk --version`) for the
-analysis meta.
+The output is `<sg>.g.vcf.gz` and `.tbi`. The task also records the GATK version (`gatk --version`) and the
+FREEMIX it used (via `bin/freemix.sh`) for the analysis meta.
 
 ### 5. Outputs
 
