@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 PROJECT = 'ds'
 OTHER = 'other'  # a second dataset, so runs span two
 
@@ -66,3 +68,36 @@ def gvcf_qc_analysis(analysis_id: int, gvcf: str, bcftools_stats: bool = True) -
         'variant_calling_detail_metrics': f'{stem}.variant_calling_detail_metrics',
     } | ({'bcftools_stats': f'{stem}.bcftools-stats'} if bcftools_stats else {})
     return {'id': analysis_id, 'type': 'gvcf_qc', 'outputs': outputs(gvcf, **secondary), 'meta': {}}
+
+
+def to_genotype(sg_id: str, data: Path, project: str = PROJECT, analysis_id: int = 1, **meta: str) -> dict:
+    """An SG with a CRAM and its CRAM QC, as local placeholder files so a stub run can stage them."""
+    cram = touch(data / sg_id / f'{sg_id}.cram')
+    touch(data / sg_id / f'{sg_id}.cram.crai')
+    selfsm = touch(data / sg_id / f'{sg_id}.verify-bamid.selfSM')
+    analyses = [cram_analysis(analysis_id, cram, **meta), cram_qc_analysis(analysis_id + 1, cram, verifybamid=selfsm)]
+    return sg(sg_id, analyses, project=project)
+
+
+def genotyped(sg_id: str, data: Path, project: str = PROJECT, qc: bool = False, analysis_id: int = 1) -> dict:
+    """An SG with a gVCF that cpg-flow made (so its analysis records no reference), with gVCF QC if qc."""
+    gvcf = touch(data / sg_id / f'{sg_id}.g.vcf.gz')
+    touch(data / sg_id / f'{sg_id}.g.vcf.gz.tbi')
+    analyses = [gvcf_analysis(analysis_id, gvcf)] + ([gvcf_qc_analysis(analysis_id + 1, gvcf)] if qc else [])
+    return sg(sg_id, analyses, project=project)
+
+
+@pytest.fixture
+def cohort_sgs(tmp_path: Path) -> list[dict]:
+    """
+    SGs across two datasets. CPG1-CPG3 are to genotype: CPG1's CRAM analysis records its reference, CPG2's and
+    CPG3's (older CRAMs) don't. CPG4 and CPG5 are genotyped, and only CPG4's gVCF has gVCF QC.
+    """
+    data = tmp_path / 'data'
+    return [
+        to_genotype('CPG1', data, ref_fasta=str(tmp_path / 'refs' / 'unmasked.fasta')),
+        to_genotype('CPG2', data),
+        to_genotype('CPG3', data, project=OTHER),
+        genotyped('CPG4', data, project=OTHER, qc=True),
+        genotyped('CPG5', data),
+    ]
