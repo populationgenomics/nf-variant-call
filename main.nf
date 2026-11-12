@@ -9,6 +9,7 @@ include { BUILD_SAMPLESHEET } from './modules/local/build_samplesheet'
 include { MAKE_INTERVALS } from './modules/local/make_intervals'
 include { PREFLIGHT } from './modules/local/preflight'
 include { GENOTYPE } from './subworkflows/local/genotype'
+include { GVCF_QC } from './subworkflows/local/gvcf_qc'
 
 /*
  * Types only: the defaults are in nextflow.config, which conf/base.config reads before this script is parsed.
@@ -246,7 +247,7 @@ workflow {
     )
 
     // each CRAM is read from GCS through its index, as nf-align publishes it, not staged
-    GENOTYPE(
+    def genotyped = GENOTYPE(
         rows.to_genotype.map { meta -> [meta, meta.cram, "${meta.cram}.crai".toString()] },
         intervals,
         file(params.noalt_bed),
@@ -254,5 +255,13 @@ workflow {
         params.downsample_reads,
         params.pairhmm_threads,
         params.reblock_gq_bands,
+    )
+
+    // every new gVCF, against the reference its CRAM was written with, and each QC-only SG's registered gVCF,
+    // against the one its gvcf analysis records (meta.ref, from the row's gvcf_ref)
+    GVCF_QC(
+        genotyped.gvcf.mix(rows.qc_only.map { meta -> [meta, file(meta.gvcf), file("${meta.gvcf}.tbi")] }),
+        file(genome ? params.genome_evaluation_regions : params.exome_evaluation_regions),
+        [file(params.dbsnp_vcf), file("${params.dbsnp_vcf}.idx")],
     )
 }

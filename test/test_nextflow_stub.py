@@ -242,7 +242,8 @@ def test_reusing_an_ar_guid_fails_before_any_task(run):
     console = result.stdout + result.stderr
     assert 'Run records' not in console
     assert (run_dir(out, 'second') / 'samplesheet.tsv').exists()
-    assert f'{len(TO_GENOTYPE) * 2} output(s) already exist' in console
+    # each SG to genotype's gVCF and .tbi, and its gVCF QC
+    assert f'{len(TO_GENOTYPE) * (2 + len(GVCF_QC_SUFFIXES))} output(s) already exist' in console
     assert f'{gvcf_dir(out, OTHER)}/CPG3.g.vcf.gz.tbi' in console
 
 
@@ -475,5 +476,98 @@ def test_a_failed_interval_drops_only_that_sg_and_resume_finishes_it(run, tmp_pa
     # the resumed run carries on from the cached sheet and pre-flight check, and runs only what failed
     result, out, tasks = run('-resume', '--genotyping_intervals', '3')
     assert result.returncode == 0, result.stdout + result.stderr
-    assert completed(tasks) == {'GENOTYPE:GENOTYPE_INTERVAL (CPG3:0002)', 'GENOTYPE:POSTPROC_GVCF (CPG3)'}
+    assert completed(tasks) == {
+        'GENOTYPE:GENOTYPE_INTERVAL (CPG3:0002)',
+        'GENOTYPE:POSTPROC_GVCF (CPG3)',
+        'GVCF_QC:VARIANT_CALLING_METRICS (CPG3)',
+        'GVCF_QC:BCFTOOLS_STATS (CPG3)',
+    }
     assert (gvcf_dir(out, OTHER) / 'CPG3.g.vcf.gz').exists()
+
+
+def published_qc(out: Path, sg_ids: dict[str, str], prefix: str = '') -> dict[str, set[str]]:
+    """Each SG's published gVCF QC files, by SG, for SGs (SG -> its dataset) that have a gVCF QC dir."""
+    dirs = {sg_id: gvcf_qc_dir(out, ds, sg_id, prefix) for sg_id, ds in sg_ids.items()}
+    return {sg_id: {p.name for p in d.iterdir()} for sg_id, d in dirs.items() if d.exists()}
+
+
+@pytest.mark.parametrize(('sequencing_type', 'prefix'), [('genome', ''), ('exome', 'exome')])
+def test_new_and_qc_only_gvcfs_get_gvcf_qc(run, sequencing_type, prefix):
+    result, out, tasks = run('--qc_genotyped', 'true', '--genotyping_intervals', '2', sequencing_type=sequencing_type)
+    assert result.returncode == 0, result.stdout + result.stderr
+    qcd = set(TO_GENOTYPE) | {QC_ONLY}
+    assert task_names(tasks, 'VARIANT_CALLING_METRICS') == qcd
+    assert task_names(tasks, 'BCFTOOLS_STATS') == qcd
+    # CPG4's gVCF already has gVCF QC
+    every_sg = TO_GENOTYPE | {'CPG4': OTHER, QC_ONLY: PROJECT}
+    assert published_qc(out, every_sg, prefix) == {
+        sg_id: {f'{sg_id}.{suffix}' for suffix in GVCF_QC_SUFFIXES} for sg_id in qcd
+    }
+
+
+def test_a_qc_only_sg_is_qcd_without_being_genotyped(run, tmp_path):
+    result, out, tasks = run('--qc_genotyped', 'true', '--genotyping_intervals', '2')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert QC_ONLY not in task_names(tasks, 'GENOTYPE_INTERVAL') | task_names(tasks, 'POSTPROC_GVCF')
+    assert not (gvcf_dir(out, PROJECT) / f'{QC_ONLY}.g.vcf.gz').exists()
+    # its registered gVCF is the one QC'd
+    for process in ['VARIANT_CALLING_METRICS', 'BCFTOOLS_STATS']:
+        workdir = task_dir(tasks, tmp_path, f'GVCF_QC:{process} ({QC_ONLY})')
+        registered = tmp_path / 'data' / QC_ONLY / f'{QC_ONLY}.g.vcf.gz'
+        assert (workdir / f'{QC_ONLY}.g.vcf.gz').resolve() == registered
+        assert (workdir / f'{QC_ONLY}.g.vcf.gz.tbi').resolve() == Path(f'{registered}.tbi')
+
+
+def test_a_run_of_only_genotyped_sgs_does_qc_only(run, tmp_path):
+    rows = [r for r in read_tsv(tmp_path / 'sheet.tsv') if r['gvcf']]
+    write_sheet(rows, str(tmp_path / 'sheet.tsv'))
+    result, out, tasks = run('--qc_genotyped', 'true')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert completed(tasks) == {
+        'PREFLIGHT',
+        f'GVCF_QC:VARIANT_CALLING_METRICS ({QC_ONLY})',
+        f'GVCF_QC:BCFTOOLS_STATS ({QC_ONLY})',
+    }
+    assert published_qc(out, {'CPG4': OTHER, QC_ONLY: PROJECT}) == {
+        QC_ONLY: {f'{QC_ONLY}.{suffix}' for suffix in GVCF_QC_SUFFIXES}
+    }
+
+
+@pytest.mark.parametrize('sequencing_type', ['genome', 'exome'])
+def test_gvcf_qc_uses_the_evaluation_regions_and_the_gvcfs_own_reference(run, tmp_path, sequencing_type):
+    # CPG5's gVCF was written against a reference other than aligned_ref_fasta (masked), which is also the
+    # reference of an older CRAM, such as CPG3's
+    edit_sheet(tmp_path, QC_ONLY, gvcf_ref=str(tmp_path / 'refs' / 'unmasked.fasta'))
+    result, _out, tasks = run('--qc_genotyped', 'true', '--genotyping_intervals', '2', sequencing_type=sequencing_type)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for sg_id, ref in [('CPG1', 'unmasked'), ('CPG3', 'masked'), (QC_ONLY, 'unmasked')]:
+        workdir = task_dir(tasks, tmp_path, f'GVCF_QC:VARIANT_CALLING_METRICS ({sg_id})')
+        command = (workdir / '.command.sh').read_text()
+        assert f'BedToIntervalList -I intervals/{sequencing_type}_evaluation.bed -O evaluation.interval_list' in command
+        assert command.count(f'-SD ref/{ref}.dict') == 2
+        assert {p.name for p in (workdir / 'ref').iterdir()} == {f'{ref}.dict'}
+        assert f'-I {sg_id}.g.vcf.gz ' in command
+        assert '--DBSNP dbsnp/dbsnp.vcf ' in command
+        assert (workdir / 'dbsnp' / 'dbsnp.vcf.idx').exists()
+        assert '--GVCF_INPUT true' in command
+
+        workdir = task_dir(tasks, tmp_path, f'GVCF_QC:BCFTOOLS_STATS ({sg_id})')
+        command = (workdir / '.command.sh').read_text()
+        assert f'bcftools_stats.sh {sg_id}.g.vcf.gz ref/{ref}.fasta {sg_id}.bcftools-stats' in command
+        assert {p.name for p in (workdir / 'ref').iterdir()} == {f'{ref}.fasta', f'{ref}.fasta.fai'}
+
+
+def test_a_failed_qc_task_publishes_only_the_other_tasks_files(run, tmp_path):
+    inject = tmp_path / 'fail.config'
+    inject.write_text(
+        "process { withName: 'BCFTOOLS_STATS' { beforeScript = { meta.id == 'CPG3' ? 'exit 1' : 'true' } } }\n",
+    )
+    result, out, tasks = run('-c', str(inject), '--genotyping_intervals', '2')
+    assert result.returncode == 0, result.stdout + result.stderr
+    # the gVCF is unaffected
+    assert (gvcf_dir(out, OTHER) / 'CPG3.g.vcf.gz').exists()
+    assert published_qc(out, {'CPG3': OTHER})['CPG3'] == {
+        'CPG3.variant_calling_summary_metrics',
+        'CPG3.variant_calling_detail_metrics',
+    }
+    assert 'CPG3' in task_names(tasks, 'VARIANT_CALLING_METRICS')
