@@ -1,4 +1,5 @@
-"""Offline `nextflow run -stub` checks of main.nf's wiring. Placeholder files stand in for data, and the tests are
+"""Offline `nextflow run -stub` checks of main.nf's wiring: params, the run-records check and the published sample
+sheet. The SGs span two datasets (conftest.cohort_sgs). Placeholder files stand in for data, and the tests are
 skipped when nextflow isn't on PATH."""
 
 import csv
@@ -7,7 +8,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import PROJECT, touch
+from build_samplesheet import build_rows, write_sheet
+from conftest import OTHER, PROJECT, touch
 
 pytestmark = pytest.mark.skipif(shutil.which('nextflow') is None, reason='nextflow not installed')
 
@@ -25,8 +27,15 @@ REFERENCES = {
     'genome_evaluation_regions': 'genome_evaluation.bed',
     'exome_evaluation_regions': 'exome_evaluation.bed',
 }
-# files that sit beside the references
-COMPANIONS = ['masked.fasta.fai', 'masked.dict', 'dbsnp.vcf.idx']
+# files that sit beside the references, and the reference CPG1's CRAM analysis records (conftest.cohort_sgs)
+COMPANIONS = [
+    'masked.fasta.fai',
+    'masked.dict',
+    'dbsnp.vcf.idx',
+    'unmasked.fasta',
+    'unmasked.fasta.fai',
+    'unmasked.dict',
+]
 
 
 def read_tsv(path: Path, sep: str = '\t') -> list[dict]:
@@ -34,12 +43,24 @@ def read_tsv(path: Path, sep: str = '\t') -> list[dict]:
         return list(csv.DictReader(handle, delimiter=sep))
 
 
+# the run records are under the analysis dataset's <output_root>/<ds>
+def run_dir(out: Path, ar_guid: str = 'local-test') -> Path:
+    return out / PROJECT / 'genotyping_samplesheets' / ar_guid
+
+
 @pytest.fixture
-def run(tmp_path):
+def run(tmp_path, cohort_sgs):
     """
-    Run main.nf in stub mode with PROJECT as the analysis dataset; returns (result, output_root, trace rows).
+    Run main.nf in stub mode over a sheet built from conftest.cohort_sgs, across two datasets, with PROJECT as the
+    analysis dataset; returns (result, output_root, trace rows). BUILD_SAMPLESHEET's stub hands over sheet.tsv,
+    which a test may edit before its first run.
     """
     refs = tmp_path / 'refs'
+    sheet = tmp_path / 'sheet.tsv'
+    masked = str(refs / REFERENCES['aligned_ref_fasta'])
+    write_sheet(build_rows(cohort_sgs, 'standard', 'genome', masked, masked), str(sheet))
+    sheet_config = tmp_path / 'sheet.config'
+    sheet_config.write_text(f"process {{ withName: 'BUILD_SAMPLESHEET' {{ ext.stub_samplesheet = '{sheet}' }} }}\n")
     for name in [*set(REFERENCES.values()), *COMPANIONS]:
         touch(refs / name)
 
@@ -57,6 +78,7 @@ def run(tmp_path):
             [
                 'nextflow', 'run', str(MAIN_NF), '-stub', '-profile', 'test',
                 '-with-trace', str(trace),
+                '-c', str(sheet_config),
                 *inputs,
                 '--output_root', str(out),
                 '--dataset', PROJECT,
@@ -146,3 +168,40 @@ def test_workflow_needs_every_container(run, tmp_path, name):
     assert result.returncode != 0
     assert f'Parameter `{name}` is required' in result.stdout + result.stderr
     assert not tasks
+
+
+@pytest.mark.parametrize('inputs', [('--cohorts', 'COH1,COH2'), ('--sgids', 'CPG1,CPG2')])
+def test_cohorts_or_sgids_are_built_into_the_published_sheet(run, tmp_path, inputs):
+    result, out, tasks = run(inputs=inputs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [t['name'] for t in tasks] == ['BUILD_SAMPLESHEET (standard)']
+    # the run records, just the sample sheet, go to the analysis dataset only
+    assert {p.name for p in run_dir(out).iterdir()} == {'samplesheet.tsv'}
+    assert not (out / OTHER / 'genotyping_samplesheets').exists()
+    assert (run_dir(out) / 'samplesheet.tsv').read_text() == (tmp_path / 'sheet.tsv').read_text()
+
+
+def test_reusing_an_ar_guid_fails_before_any_task(run):
+    result, out, _tasks = run()
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    result, _out, tasks = run()
+    assert result.returncode != 0
+    console = result.stdout + result.stderr
+    assert 'Run records for arGuid local-test already exist' in console
+    assert f'{run_dir(out)}/samplesheet.tsv' in console
+    assert not tasks
+
+    # a new arGuid gets its own run records
+    result, out, _tasks = run(ar_guid='second')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (run_dir(out, 'second') / 'samplesheet.tsv').exists()
+
+
+def test_resume_skips_the_run_records_check_and_reuses_the_sheet(run):
+    result, _out, _tasks = run()
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    result, _out, tasks = run('-resume')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [(t['name'], t['status']) for t in tasks] == [('BUILD_SAMPLESHEET (standard)', 'CACHED')]

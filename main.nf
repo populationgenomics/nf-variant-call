@@ -5,6 +5,8 @@
  * --qc_genotyped, already-genotyped SGs without gVCF QC get gVCF QC alone. See docs/DESIGN.md.
  */
 
+include { BUILD_SAMPLESHEET } from './modules/local/build_samplesheet'
+
 /*
  * Types only: the defaults are in nextflow.config, which conf/base.config reads before this script is parsed.
  * Nextflow converts command-line values to these types (`--register false` is a Boolean), and fails the run if a
@@ -108,6 +110,21 @@ def validateParams() {
     }
 }
 
+/*
+ * Fail before the sample sheet is built if this arGuid's run records already exist: publishDir would keep the
+ * old ones silently. arGuid is unique in production, but set by hand while testing. A resumed run finds its
+ * own records there, so -resume skips the check.
+ */
+def checkNoRunRecords() {
+    if (workflow.resume) {
+        return
+    }
+    def sheet = "${runDir()}/samplesheet.tsv"
+    if (file(sheet).exists()) {
+        error("Run records for arGuid ${params.arGuid} already exist. Launch with a new --arGuid:\n  ${sheet}")
+    }
+}
+
 // error() inside a channel operator reaches the console only as "Unexpected error", so log the reason first
 def fail(message) {
     log.error(message)
@@ -116,4 +133,21 @@ def fail(message) {
 
 workflow {
     validateParams()
+    checkNoRunRecords()
+
+    // every run starts from a sheet built from Metamist: SGs are discovered through cohorts, or queried directly,
+    // and one of the two lists is empty. A resumed run takes the sheet from the cache, not from Metamist, which
+    // would by now see the SGs its first attempt registered as genotyped. So it carries on with the same SGs, and
+    // the cached pre-flight check lets its own published files through
+    def cohorts = params.cohorts ? idList(params.cohorts) : []
+    def sgids = params.sgids ? idList(params.sgids) : []
+    BUILD_SAMPLESHEET(
+        params.accessLevel,
+        params.sequencing_type,
+        cohorts,
+        sgids,
+        params.aligned_ref_fasta,
+        params.genotyped_ref_fasta,
+        runDir(),
+    )
 }
