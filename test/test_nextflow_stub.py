@@ -62,6 +62,14 @@ GVCF_QC_SUFFIXES = ['variant_calling_summary_metrics', 'variant_calling_detail_m
 QC_ONLY = 'CPG5'  # with --qc_genotyped: genotyped, without gVCF QC
 
 
+TO_GENOTYPE = {'CPG1': PROJECT, 'CPG2': PROJECT, 'CPG3': OTHER}  # SG -> its dataset
+
+
+def task_names(tasks: list[dict], process: str) -> set[str]:
+    """Tags of the trace's tasks for one process, e.g. {'CPG1', 'CPG3:0002'}."""
+    return {t['name'].split('(')[1].rstrip(')') for t in tasks if t['name'].split(' ')[0].endswith(process)}
+
+
 def completed(tasks: list[dict]) -> set[str]:
     """Names of the tasks that ran, other than building the sample sheet, which every new run does first."""
     return {t['name'] for t in tasks if t['status'] == 'COMPLETED' and t['name'] != 'BUILD_SAMPLESHEET (standard)'}
@@ -227,10 +235,15 @@ def test_reusing_an_ar_guid_fails_before_any_task(run):
     assert f'{run_dir(out)}/samplesheet.tsv' in console
     assert not tasks
 
-    # a new arGuid gets its own run records
+    # a new arGuid gets its own run records, and goes on to the pre-flight check, which stops on the gVCFs the
+    # first run published
     result, out, _tasks = run(ar_guid='second')
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode != 0
+    console = result.stdout + result.stderr
+    assert 'Run records' not in console
     assert (run_dir(out, 'second') / 'samplesheet.tsv').exists()
+    assert f'{len(TO_GENOTYPE) * 2} output(s) already exist' in console
+    assert f'{gvcf_dir(out, OTHER)}/CPG3.g.vcf.gz.tbi' in console
 
 
 def test_row_without_a_dataset_fails_early(run, tmp_path):
@@ -412,3 +425,55 @@ def test_genotype_interval_reads_the_cram_where_it_is_and_stages_its_reference(r
         assert staged == {f'{ref}.fasta', f'{ref}.fasta.fai', f'{ref}.dict'}
         assert f'-R ref/{ref}.fasta ' in command
         assert (workdir / f'{sg_id}.verify-bamid.selfSM').exists()
+
+
+@pytest.mark.parametrize(('sequencing_type', 'prefix'), [('genome', ''), ('exome', 'exome')])
+def test_each_sg_gives_one_published_gvcf(run, sequencing_type, prefix):
+    result, out, tasks = run('--genotyping_intervals', '3', sequencing_type=sequencing_type)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert task_names(tasks, 'GENOTYPE_INTERVAL') == {f'{s}:{i:04d}' for s in TO_GENOTYPE for i in range(1, 4)}
+    assert task_names(tasks, 'POSTPROC_GVCF') == set(TO_GENOTYPE)
+    for ds in [PROJECT, OTHER]:
+        sg_ids = [s for s, d in TO_GENOTYPE.items() if d == ds]
+        published = {p.name for p in gvcf_dir(out, ds, prefix).iterdir()}
+        assert published == {f'{s}.g.vcf.gz{ext}' for s in sg_ids for ext in ['', '.tbi']}
+    # genotyped SGs aren't genotyped again
+    assert not (gvcf_dir(out, OTHER, prefix) / 'CPG4.g.vcf.gz').exists()
+    assert not (gvcf_dir(out, PROJECT, prefix) / 'CPG5.g.vcf.gz').exists()
+
+
+@pytest.mark.parametrize('count', [1, 12])
+def test_interval_gvcfs_are_postprocessed_in_genomic_order(run, tmp_path, count):
+    result, _out, tasks = run('--genotyping_intervals', str(count))
+    assert result.returncode == 0, result.stdout + result.stderr
+    for sg_id in TO_GENOTYPE:
+        command = (task_dir(tasks, tmp_path, f'GENOTYPE:POSTPROC_GVCF ({sg_id})') / '.command.out').read_text()
+        gvcfs = ' '.join(f'in/{sg_id}.{i:04d}.g.vcf.gz' for i in range(1, count + 1))
+        ref = 'unmasked' if sg_id == 'CPG1' else 'masked'
+        selfsm = f'{sg_id}.verify-bamid.selfSM'
+        bands = '13,20,30,40'
+        assert command.split() == [
+            'postproc_gvcf.sh', sg_id, f'ref/{ref}.fasta', 'noalt/noalt.bed.gz', selfsm, bands, '3', *gvcfs.split(),
+        ]  # fmt: skip
+
+
+def test_a_failed_interval_drops_only_that_sg_and_resume_finishes_it(run, tmp_path):
+    inject = tmp_path / 'fail.config'
+    inject.write_text(
+        'process {\n'
+        "    withName: 'GENOTYPE_INTERVAL' { beforeScript = { meta.id == 'CPG3' && interval.baseName == '0002' ? "
+        "'exit 1' : 'true' } }\n"
+        '}\n',
+    )
+    result, out, tasks = run('-c', str(inject), '--genotyping_intervals', '3')
+    # an ignored failure doesn't fail the run
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert task_names(tasks, 'POSTPROC_GVCF') == {'CPG1', 'CPG2'}
+    assert not (gvcf_dir(out, OTHER) / 'CPG3.g.vcf.gz').exists()
+    assert (gvcf_dir(out, PROJECT) / 'CPG1.g.vcf.gz').exists()
+
+    # the resumed run carries on from the cached sheet and pre-flight check, and runs only what failed
+    result, out, tasks = run('-resume', '--genotyping_intervals', '3')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert completed(tasks) == {'GENOTYPE:GENOTYPE_INTERVAL (CPG3:0002)', 'GENOTYPE:POSTPROC_GVCF (CPG3)'}
+    assert (gvcf_dir(out, OTHER) / 'CPG3.g.vcf.gz').exists()

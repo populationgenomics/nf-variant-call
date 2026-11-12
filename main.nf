@@ -249,8 +249,10 @@ workflow {
     GENOTYPE(
         rows.to_genotype.map { meta -> [meta, meta.cram, "${meta.cram}.crai".toString()] },
         intervals,
+        file(params.noalt_bed),
         params.sequencing_type,
         params.downsample_reads,
         params.pairhmm_threads,
+        params.reblock_gq_bands,
     )
 }
