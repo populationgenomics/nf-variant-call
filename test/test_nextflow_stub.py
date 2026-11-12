@@ -376,3 +376,39 @@ def test_make_intervals_only_runs_if_anything_is_to_genotype(run, tmp_path):
     result, _out, tasks = run('--qc_genotyped', 'true')
     assert result.returncode == 0, result.stdout + result.stderr
     assert not [t for t in tasks if t['name'].startswith('MAKE_INTERVALS')]
+
+
+@pytest.mark.parametrize('sequencing_type', ['genome', 'exome'])
+def test_genotype_interval_runs_haplotypecaller_without_dragen_mode_and_with_contamination(
+    run, tmp_path, sequencing_type
+):
+    result, _out, tasks = run('--genotyping_intervals', '3', sequencing_type=sequencing_type)
+    assert result.returncode == 0, result.stdout + result.stderr
+    workdir = task_dir(tasks, tmp_path, 'GENOTYPE:GENOTYPE_INTERVAL (CPG1:0002)')
+    command = (workdir / '.command.sh').read_text()
+    assert '--dragen-mode' not in command
+    assert '--contamination-fraction-to-filter $FREEMIX' in command
+    assert '-L intervals/0002.interval_list' in command
+    assert '-O CPG1.0002.g.vcf.gz' in command
+    # downsampling is for genomes only
+    assert ('--max-reads-per-alignment-start 20' in command) == (sequencing_type == 'genome')
+
+
+def test_genotype_interval_reads_the_cram_where_it_is_and_stages_its_reference(run, tmp_path):
+    result, _out, tasks = run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    # one task per SG to genotype per interval
+    assert len([t for t in tasks if 'GENOTYPE_INTERVAL' in t['name']]) == 3 * 30
+    data = tmp_path / 'data'
+    for sg_id, ref in [('CPG1', 'unmasked'), ('CPG3', 'masked')]:
+        workdir = task_dir(tasks, tmp_path, f'GENOTYPE:GENOTYPE_INTERVAL ({sg_id}:0001)')
+        command = (workdir / '.command.sh').read_text()
+        cram = data / sg_id / f'{sg_id}.cram'
+        assert f'-I {cram} ' in command
+        assert f'--read-index {cram}.crai ' in command
+        assert not list(workdir.rglob('*.cram*'))
+        # the reference the CRAM was written against: an older CRAM's analysis records none
+        staged = {p.name for p in (workdir / 'ref').iterdir()}
+        assert staged == {f'{ref}.fasta', f'{ref}.fasta.fai', f'{ref}.dict'}
+        assert f'-R ref/{ref}.fasta ' in command
+        assert (workdir / f'{sg_id}.verify-bamid.selfSM').exists()

@@ -8,6 +8,7 @@
 include { BUILD_SAMPLESHEET } from './modules/local/build_samplesheet'
 include { MAKE_INTERVALS } from './modules/local/make_intervals'
 include { PREFLIGHT } from './modules/local/preflight'
+include { GENOTYPE } from './subworkflows/local/genotype'
 
 /*
  * Types only: the defaults are in nextflow.config, which conf/base.config reads before this script is parsed.
@@ -155,7 +156,7 @@ def checkNoRunRecords() {
  * A sample sheet row -> meta: the SG's destinations, and what its tasks read. kind is to_genotype, genotyped, or
  * qc_only (a genotyped SG whose gVCF has no gvcf_qc analysis, with --qc_genotyped). ref is the reference the SG's
  * tasks read: the CRAM's for an SG to genotype, which its new gVCF is then written against, or the registered
- * gVCF's otherwise. gvcf is the registered gVCF, or where this run publishes the new one.
+ * gVCF's otherwise, and refDict its .dict. gvcf is the registered gVCF, or where this run publishes the new one.
  */
 def parseRow(r) {
     // decides where the SG is published and registered, and which dataset its compute is billed to
@@ -183,6 +184,7 @@ def parseRow(r) {
         project: metamistProject(r.dataset),
         cram: r.cram ?: null,
         ref: ref,
+        refDict: refDict(ref),
         selfsm: r.selfsm ?: null,
         gvcf: genotyped ? r.gvcf : "${base}gvcf/${r.sg_id}.g.vcf.gz".toString(),
         gvcfDir: "${base}gvcf".toString(),
@@ -241,5 +243,14 @@ workflow {
         file(params.calling_exclusions),
         rows.to_genotype.first().map { _meta -> interval_count },
         genome ? 100000 : 0,
+    )
+
+    // each CRAM is read from GCS through its index, as nf-align publishes it, not staged
+    GENOTYPE(
+        rows.to_genotype.map { meta -> [meta, meta.cram, "${meta.cram}.crai".toString()] },
+        intervals,
+        params.sequencing_type,
+        params.downsample_reads,
+        params.pairhmm_threads,
     )
 }
