@@ -1,0 +1,166 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://raw.githubusercontent.com/populationgenomics/nf-variant-call/main/nextflow_schema.json",
+    "title": "nf-variant-call parameters",
+    "description": "CRAM -> single-sample reblocked gVCF with GATK HaplotypeCaller, plus gVCF QC, driven by Metamist cohorts or sequencing groups. main.nf validates these itself; this schema drives launch forms.",
+    "type": "object",
+    "$defs": {
+        "run": {
+            "title": "What to genotype",
+            "type": "object",
+            "required": ["dataset", "sequencing_type", "arGuid"],
+            "properties": {
+                "dataset": {
+                    "type": "string",
+                    "description": "The analysis dataset (no -test suffix): the run is launched under it and pays for it, and its bucket holds the run records. Each SG is published to and registered in its own dataset, which can differ."
+                },
+                "sequencing_type": {
+                    "type": "string",
+                    "enum": ["genome", "exome"],
+                    "description": "One sequencing type per run. Exome outputs are written under exome/."
+                },
+                "accessLevel": {
+                    "type": "string",
+                    "enum": ["full", "standard", "test"],
+                    "default": "standard",
+                    "description": "Applies to the whole run. full and standard are equivalent: every SG must be in a production project, and is published to gs://cpg-<ds>-main. test: every SG must be in a <ds>-test project, and is registered there and published to gs://cpg-<ds>-test."
+                },
+                "arGuid": {
+                    "type": "string",
+                    "description": "analysis-runner GUID: labels compute, names the per-run record directory, and is recorded on each analysis."
+                },
+                "cohorts": {
+                    "type": "string",
+                    "description": "Comma-separated Metamist cohort IDs to build the sample sheet from. Exactly one of cohorts or sgids."
+                },
+                "sgids": {
+                    "type": "string",
+                    "description": "Comma-separated Metamist sequencing group IDs, queried directly instead of through cohorts. Each must be a short-read SG of sequencing_type, and can be in any project at the run's access level. Exactly one of cohorts or sgids."
+                },
+                "output_root": {
+                    "type": "string",
+                    "description": "For local and test runs: publish each dataset's outputs under <output_root>/<dataset>/ instead of its bucket."
+                }
+            }
+        },
+        "genotyping": {
+            "title": "Genotyping",
+            "type": "object",
+            "properties": {
+                "aligned_ref_fasta": {
+                    "type": "string",
+                    "description": "Reference of a CRAM whose cram analysis doesn't record one: by default the DRAGEN-masked FASTA the CRAMs made before nf-align used. Needs <name>.dict and .fai alongside."
+                },
+                "calling_regions_genome": {
+                    "type": "string",
+                    "description": "Interval list of the regions genotyped in genomes."
+                },
+                "calling_regions_exome": {
+                    "type": "string",
+                    "description": "Interval list of the regions genotyped in exomes."
+                },
+                "calling_exclusions": {
+                    "type": "string",
+                    "description": "Interval list of regions removed from the calling regions: telomeres, centromeres and hard calling exclusions."
+                },
+                "noalt_bed": {
+                    "type": "string",
+                    "description": "BED of the primary contigs plus chrM. Records outside it are dropped from the final gVCF."
+                },
+                "genotyping_intervals": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "description": "How many genotyping intervals each SG is split into. 0 means 30 for genomes and 1 for exomes."
+                },
+                "downsample_reads": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "description": "HaplotypeCaller's --max-reads-per-alignment-start, for genomes only."
+                },
+                "pairhmm_threads": {
+                    "type": "integer",
+                    "default": 4,
+                    "minimum": 1,
+                    "description": "HaplotypeCaller's --native-pair-hmm-threads."
+                },
+                "reblock_gq_bands": {
+                    "type": "array",
+                    "items": { "type": "integer", "minimum": 1 },
+                    "default": [13, 20, 30, 40],
+                    "description": "ReblockGVCF's GQ bands (-GQB). A list, so set it in a config or params file rather than on the command line."
+                }
+            }
+        },
+        "gvcf_qc": {
+            "title": "gVCF QC",
+            "type": "object",
+            "properties": {
+                "qc_genotyped": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also run gVCF QC on each already-genotyped SG whose gVCF has no 'gvcf_qc' analysis, against the gVCF's own reference, without genotyping it again."
+                },
+                "genotyped_ref_fasta": {
+                    "type": "string",
+                    "description": "Reference of a gVCF whose gvcf analysis doesn't record one (every gVCF cpg-flow made): by default the DRAGEN-masked FASTA. Only used for QC-only SGs. Needs <name>.dict and .fai alongside."
+                },
+                "dbsnp_vcf": {
+                    "type": "string",
+                    "description": "dbSNP VCF, with its .idx alongside, for CollectVariantCallingMetrics."
+                },
+                "genome_evaluation_regions": {
+                    "type": "string",
+                    "description": "BED of the regions gVCF QC evaluates in genomes. Converted to an interval list headed with each gVCF's own reference .dict."
+                },
+                "exome_evaluation_regions": {
+                    "type": "string",
+                    "description": "BED of the regions gVCF QC evaluates in exomes. Converted to an interval list headed with each gVCF's own reference .dict."
+                }
+            }
+        },
+        "registration": {
+            "title": "Metamist registration",
+            "type": "object",
+            "properties": {
+                "register": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Register each published gVCF as one Metamist 'gvcf' analysis, with its index as a secondary file, and, after it, its gVCF QC as one 'gvcf_qc' analysis."
+                },
+                "register_wait_minutes": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 1,
+                    "description": "How long registration waits for an analysis's files to be published."
+                }
+            }
+        },
+        "containers": {
+            "title": "Containers",
+            "type": "object",
+            "properties": {
+                "gatk_container": {
+                    "type": "string",
+                    "description": "Image with GATK, bcftools and tabix: genotyping, gVCF postprocessing and bcftools stats."
+                },
+                "picard_container": {
+                    "type": "string",
+                    "description": "Image with picard: genotyping intervals and CollectVariantCallingMetrics."
+                },
+                "cpg_container": {
+                    "type": "string",
+                    "description": "Image with metamist and cpg_utils, for the sample sheet and registration."
+                }
+            }
+        }
+    },
+    "allOf": [
+        { "$ref": "#/$defs/run" },
+        { "$ref": "#/$defs/genotyping" },
+        { "$ref": "#/$defs/gvcf_qc" },
+        { "$ref": "#/$defs/registration" },
+        { "$ref": "#/$defs/containers" }
+    ]
+}
