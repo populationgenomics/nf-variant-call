@@ -16,8 +16,6 @@ Terms are defined in [GLOSSARY.md](../GLOSSARY.md), which this pipeline shares w
 [RISKS.md](RISKS.md) lists what may bite later, and the decisions with real trade-offs are recorded in
 [adr/](adr/).
 
-**Status: design only.** Nothing is implemented yet. See [Status and next steps](#status-and-next-steps).
-
 ## Scope of a run
 
 The scope is the same as nf-align's. A run is launched under one **analysis dataset** and covers **one
@@ -138,8 +136,9 @@ picard IntervalListTools -SCATTER_COUNT <N> -SUBDIVISION_MODE INTERVAL_SUBDIVISI
     -OUTPUT out
 ```
 
-Exclusions are subtracted even when N is 1, unlike cpg-flow, so the regions genotyped never depend on N. Every SG
-in the run gets the same lists. The task is cached, so `-resume` keeps them.
+Exclusions are always subtracted and HaplotypeCaller always gets `-L`, even when N is 1, so the regions genotyped
+never depend on N. cpg-flow, with a scatter count of 1, calls the whole reference without intervals; in practice it
+always ran with 30–50, so its gVCFs cover the same regions as ours. Every SG in the run gets the same lists. The task is cached, so `-resume` keeps them.
 
 ### 4. GENOTYPE subworkflow
 
@@ -295,6 +294,7 @@ exact `machineType` per attempt.
 |-----------------------------------|----------------|-----------------|------------------------------------|---------------------------------------------------|
 | `GENOTYPE_INTERVAL`               | 4              | 26 GB × attempt | 20 / 20 GB (the CRAM isn't staged) | `n2-highmem-4`, `n2-highmem-8`, `n2-highmem-16`   |
 | `POSTPROC_GVCF`                   | 2              | 7 GB × attempt  | N × 1.5 + 2 GB / 20 GB             | `e2-highmem-2`, `e2-highmem-4`, `e2-highmem-8`    |
+| `VARIANT_CALLING_METRICS`         | 2              | 8 GB × attempt  | 50 / 20 GB                         | `e2-highmem-2`, `e2-highmem-4`, `e2-highmem-8`    |
 | `BCFTOOLS_STATS`                  | 1              | 2 GB × attempt  | 50 / 20 GB                         | `e2-standard-2`, `e2-standard-2`, `e2-standard-4` |
 | `MAKE_INTERVALS`                  | 1              | 2 GB            | default                            | `e2-standard-2`                                   |
 | `BUILD_SAMPLESHEET`, `REGISTER_*` | 1              | 4 / 2 GB        | default                            | `e2-standard-2`                                   |
@@ -329,8 +329,7 @@ uv run pytest
 
 ## Status and next steps
 
-**Not started.** The design above was settled in a grilling session on 2026-11-12. Before the first production
-run:
+The design above was settled in a grilling session on 2026-11-12. Before the first production run:
 
 1. Create the `gvcf_qc` analysis type in Metamist.
 2. Convert cpg-flow's genome evaluation interval list to BED, and check there's a `.dict` beside the
@@ -341,7 +340,9 @@ run:
 5. Separately: back-fill cpg-flow's gVCF QC results as `gvcf_qc` analyses.
 
 **Judgement calls made while writing this, for review:**
-- Exclusions are subtracted even when N is 1, unlike cpg-flow.
+- Exclusions are always subtracted and HaplotypeCaller always gets `-L`, even when N is 1. cpg-flow, with a
+  scatter count of 1, calls the whole reference without intervals; in practice it always ran with 30–50, so its
+  gVCFs cover the same regions as ours.
 - A genotyped SG needs no CRAM or `cram_qc`, so `--qc_genotyped` works on SGs whose CRAMs were archived.
 - There is no switch to turn gVCF QC off, unlike nf-align's `--cram_qc`.
 - The GATK version in the meta is taken at runtime from the image, not from a param.
