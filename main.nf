@@ -6,7 +6,6 @@
  */
 
 include { BUILD_SAMPLESHEET } from './modules/local/build_samplesheet'
-include { MAKE_INTERVALS } from './modules/local/make_intervals'
 include { PREFLIGHT } from './modules/local/preflight'
 include { GENOTYPE } from './subworkflows/local/genotype'
 include { GVCF_QC } from './subworkflows/local/gvcf_qc'
@@ -240,18 +239,12 @@ workflow {
             qc_only: meta.kind == 'qc_only'
         }
 
-    // once per run, and only if there's anything to genotype: every SG gets the same lists
-    def intervals = MAKE_INTERVALS(
-        file(genome ? params.calling_regions_genome : params.calling_regions_exome),
-        file(params.calling_exclusions),
-        rows.to_genotype.first().map { _meta -> interval_count },
-        genome ? 100000 : 0,
-    )
-
     // each CRAM is read from GCS through its index, as nf-align publishes it, not staged
     def genotyped = GENOTYPE(
         rows.to_genotype.map { meta -> [meta, meta.cram, "${meta.cram}.crai".toString()] },
-        intervals,
+        file(genome ? params.calling_regions_genome : params.calling_regions_exome),
+        file(params.calling_exclusions),
+        interval_count,
         file(params.noalt_bed),
         params.sequencing_type,
         params.downsample_reads,

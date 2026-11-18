@@ -70,9 +70,8 @@ run-records check ─ --cohorts | --sgids ─ BUILD_SAMPLESHEET ─┐   (cached
                                                              ▼
 sample sheet ─ parse rows, per-SG destinations into meta ─ PREFLIGHT (every row) ─┬─ genotyped: nothing more
                                                                                   ├─ QC-only (--qc_genotyped)
-MAKE_INTERVALS (once per run) ─────────────────────────────────┐                  └─ to genotype
-                                                               ▼
-   to genotype: GENOTYPE: GENOTYPE_INTERVAL × N ─ groupKey ─ POSTPROC_GVCF ─ publishDir: gVCF, .tbi
+                                                                                  └─ to genotype
+   to genotype: GENOTYPE: MAKE_INTERVALS (once) ─ GENOTYPE_INTERVAL × N ─ groupKey ─ POSTPROC_GVCF ─ publishDir: gVCF, .tbi
                   ├─ REGISTER_GVCF (one gvcf analysis: gVCF + .tbi) ──────────────────┐
                   └─ GVCF_QC: VARIANT_CALLING_METRICS, BCFTOOLS_STATS ─ publishDir ───┴─ REGISTER_GVCF_QC
 
@@ -127,7 +126,7 @@ clashes are caught up front.
 
 ### 3. Genotyping intervals (`MAKE_INTERVALS`)
 
-This runs once per run, in the picard image. It splits the sequencing type's calling regions, minus
+This runs once per run, inside `GENOTYPE` and only if there's an SG to genotype, in the picard image. It splits the sequencing type's calling regions, minus
 `calling_exclusions`, into N lists. N is `genotyping_intervals`, or 30 for genomes and 1 for exomes:
 
 ```
@@ -138,12 +137,15 @@ picard IntervalListTools -SCATTER_COUNT <N> -SUBDIVISION_MODE INTERVAL_SUBDIVISI
 
 Exclusions are always subtracted and HaplotypeCaller always gets `-L`, even when N is 1, so the regions genotyped
 never depend on N. cpg-flow, with a scatter count of 1, calls the whole reference without intervals; in practice it
-always ran with 30–50, so its gVCFs cover the same regions as ours. Every SG in the run gets the same lists. The task is cached, so `-resume` keeps them.
+always ran with 30–50, so its gVCFs cover the same regions as ours. Every SG in the run gets the same lists. The
+task is cached, so `-resume` keeps them.
 
 ### 4. GENOTYPE subworkflow
 
-It **takes** `[meta, cram, crai]` for each SG to genotype, plus the interval lists. Its meta carries `ref`,
-the CRAM's reference, and `selfsm`, the VerifyBamID output. It **emits** `gvcf`: `[meta, gvcf, tbi]`.
+It **takes** `[meta, cram, crai]` for each SG to genotype, plus the calling regions, the exclusions and N, from
+which it makes the interval lists itself (§3). Its meta carries `ref`, the CRAM's reference, and `selfsm`, the
+VerifyBamID output. The CRAM and index may be URI strings or Paths: a Path is turned into its URI with
+`toUriString()`, since a cloud Path's `toString()` drops the `gs://`. It **emits** `gvcf`: `[meta, gvcf, tbi]`.
 
 **`GENOTYPE_INTERVAL`** (gatk image) runs once per SG per genotyping interval. It's cpg-flow's command without
 `--dragen-mode`, with contamination added (ADR 0001):

@@ -23,8 +23,12 @@ workflow GVCF_QC {
         evaluation_regions,
         dbsnp,
     )
+    // the .fai is resolved from the FASTA's Path, not by appending to a string, so a cloud Path keeps its scheme
     def stats = BCFTOOLS_STATS(
-        gvcfs.map { meta, gvcf, tbi -> [meta, gvcf, tbi, file(meta.ref), file("${meta.ref}.fai")] },
+        gvcfs.map { meta, gvcf, tbi ->
+            def fasta = file(meta.ref)
+            [meta, gvcf, tbi, fasta, fasta.resolveSibling("${fasta.name}.fai")]
+        },
     )
 
     // keyed by SG ID; join drops an SG missing from either

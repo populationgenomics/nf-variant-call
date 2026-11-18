@@ -76,7 +76,7 @@ def completed(tasks: list[dict]) -> set[str]:
 
 
 def task_dir(tasks: list[dict], tmp_path: Path, name: str) -> Path:
-    """The work dir of the task with this name, e.g. 'MAKE_INTERVALS (30)'."""
+    """The work dir of the task with this name, e.g. 'GENOTYPE:MAKE_INTERVALS (30)'."""
     workdir = next(t for t in tasks if t['name'].startswith(name))['hash']
     return next((tmp_path / 'work').glob(f'{workdir}*'))
 
@@ -376,10 +376,10 @@ def test_resume_checks_again_after_a_failed_pre_flight_check(run, tmp_path):
 def test_make_intervals_makes_n_lists_in_genomic_order(run, tmp_path, args, sequencing_type, count):
     result, _out, tasks = run(*args, sequencing_type=sequencing_type)
     assert result.returncode == 0, result.stdout + result.stderr
-    made = sorted(p.name for p in task_dir(tasks, tmp_path, 'MAKE_INTERVALS').glob('*.interval_list'))
+    made = sorted(p.name for p in task_dir(tasks, tmp_path, 'GENOTYPE:MAKE_INTERVALS').glob('*.interval_list'))
     assert made == [f'{i:04d}.interval_list' for i in range(1, count + 1)]
     # the sequencing type's calling regions, and the exclusions whatever N is
-    staged = task_dir(tasks, tmp_path, 'MAKE_INTERVALS')
+    staged = task_dir(tasks, tmp_path, 'GENOTYPE:MAKE_INTERVALS')
     assert [p.name for p in (staged / 'regions').iterdir()] == [f'{sequencing_type}_calling.interval_list']
     assert [p.name for p in (staged / 'exclusions').iterdir()] == ['exclusions.interval_list']
 
@@ -389,7 +389,7 @@ def test_make_intervals_only_runs_if_anything_is_to_genotype(run, tmp_path):
     write_sheet(rows, str(tmp_path / 'sheet.tsv'))
     result, _out, tasks = run('--qc_genotyped', 'true')
     assert result.returncode == 0, result.stdout + result.stderr
-    assert not [t for t in tasks if t['name'].startswith('MAKE_INTERVALS')]
+    assert not [t for t in tasks if 'MAKE_INTERVALS' in t['name']]
 
 
 @pytest.mark.parametrize('sequencing_type', ['genome', 'exome'])
@@ -665,6 +665,6 @@ def test_per_sg_tasks_are_labelled_with_the_sgs_dataset(run, tmp_path):
     for t in labelled:
         tag = t['name'].split('(')[1].rstrip(')').split(':')[0]
         # the run-level MAKE_INTERVALS is billed to the analysis dataset
-        expected = PROJECT if t['name'].startswith('MAKE_INTERVALS') else dataset[tag]
+        expected = PROJECT if 'MAKE_INTERVALS' in t['name'] else dataset[tag]
         # beforeScript's output goes to the task log, not .command.out
         assert f'LABEL={expected}' in (task_dir(tasks, tmp_path, t['name']) / '.command.log').read_text()
