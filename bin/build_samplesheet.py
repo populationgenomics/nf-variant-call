@@ -56,7 +56,7 @@ fragment SgFields on GraphQLSequencingGroup {
             name
         }
     }
-    analyses(type: {in_: ["cram", "cram_qc", "gvcf", "gvcf_qc"]}, status: {eq: COMPLETED}, active: {eq: true}) {
+    analyses(type: {in_: ["cram", "cram_qc", "gvcf", "gvcf_qc"]}, active: {eq: true}) {
         id
         type
         outputs
@@ -274,6 +274,8 @@ def main(args: Namespace) -> None:
         sgs = fetch_cohort_sgs(sorted(set(args.cohorts)))
     else:
         sgs = fetch_sgs(sorted(set(args.sgids)), args.sequencing_type)
+
+    input(sgs)
     rows = build_rows(sgs, args.access_level, args.sequencing_type, args.aligned_ref_fasta, args.genotyped_ref_fasta)
     write_sheet(rows, args.output)
     logger.info(f'{args.sequencing_type} at access level {args.access_level}: {summary(rows)} -> {args.output}')
@@ -286,7 +288,7 @@ if __name__ == '__main__':
         '--access-level',
         required=True,
         choices=sorted(ACCESS_LEVELS),
-        help='test: every SG must be in a <dataset>-test project; full or standard: none may be',
+        help='test: every SG must be in a <dataset>-test project; full or standard: <dataset>-main',
     )
     parser.add_argument('--sequencing-type', required=True, choices=sorted(SEQUENCING_TYPES))
     inputs = parser.add_mutually_exclusive_group(required=True)
