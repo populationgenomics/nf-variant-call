@@ -275,7 +275,6 @@ def main(args: Namespace) -> None:
     else:
         sgs = fetch_sgs(sorted(set(args.sgids)), args.sequencing_type)
 
-    input(sgs)
     rows = build_rows(sgs, args.access_level, args.sequencing_type, args.aligned_ref_fasta, args.genotyped_ref_fasta)
     write_sheet(rows, args.output)
     logger.info(f'{args.sequencing_type} at access level {args.access_level}: {summary(rows)} -> {args.output}')
